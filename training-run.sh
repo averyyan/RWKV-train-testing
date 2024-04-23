@@ -13,7 +13,7 @@ EPOCH_SAVE=10
 N_NODE=1 
 GPU_PER_NODE=1 
 DS_BUCKET_MB=2 
-python3 train.py --load_model "0" --wandb "Test" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
+python3 train.py --load_model "0" --proj_dir $PROJ_DIR --my_testing $MODEL_TYPE \
  --ctx_len $CTX_LEN --my_pile_stage 3 --epoch_count 999999 --epoch_begin 0 \
  --data_file "data/minipile" --my_exit_tokens 1498226207 --magic_prime 2926181 \
  --num_nodes $N_NODE --micro_bsz $M_BSZ --n_layer $N_LAYER --n_embd $N_EMBD --pre_ffn 0 --head_qk 0 \
