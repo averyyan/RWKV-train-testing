@@ -1,6 +1,8 @@
 ########################################################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
+import functools
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 import os, math, gc, importlib
 import torch
@@ -14,8 +16,107 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from torch._lowrank import svd_lowrank
+import bitsandbytes as bnb
 
-# from deepspeed.runtime.fp16.onebit.zoadam import ZeroOneAdam
+LORA_CONFIG = {
+    "r": 0,
+    "alpha": 0,
+    "dropout": 0,
+    "parts": {"att", "ln", "time", "ffn"},
+}
+class LoraLinear(nn.Module):
+
+    def __init__(self, in_features: int, out_features: int, bias: bool):
+        super().__init__()
+
+        self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+        assert bias == False, "Biased LoraLinear not supported"
+
+        r, alpha, dropout = LORA_CONFIG["r"], LORA_CONFIG[
+            "alpha"], LORA_CONFIG["dropout"]
+        self.lora_A = nn.Parameter(torch.empty(r, in_features))
+        self.lora_B = nn.Parameter(torch.empty(out_features, r))
+        self.lora_dropout = nn.Dropout(dropout)
+        self.scaling = alpha / r
+        self.r = r
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        self.pissa = False
+        self.is_quant = False
+
+    def pissa_init(self, svd_niter):
+
+        self.pissa = True
+        Ur, Sr, Vr = svd_lowrank(self.weight.data, self.r, niter=svd_niter)
+        Vhr = Vr.t()
+        lora_A = torch.diag(torch.sqrt(Sr)) @ Vhr
+        lora_B = Ur @ torch.diag(torch.sqrt(Sr))
+        self.lora_A.data = lora_A
+        self.lora_B.data = lora_B
+        self.weight.data = self.weight.data - lora_B @ lora_A
+    def quant(self, quant_type):
+        self.is_quant = True
+        self.quant_type = quant_type
+        if self.quant_type=='4bit':
+            self.weight.data, self.qstate= bnb.functional.quantize_4bit((self.weight.data).to('cuda'))
+        elif self.quant_type=='nf4':
+            self.weight.data, self.qstate= bnb.functional.quantize_nf4((self.weight.data).to('cuda'))
+        elif self.quant_type=='fp4':
+            self.weight.data, self.qstate= bnb.functional.quantize_fp4((self.weight.data).to('cuda'))
+
+    def forward(self, x):
+
+        if self.is_quant:
+            if self.quant_type=='4bit':
+                if self.pissa:
+                    return (
+                        F.linear(x, bnb.functional.dequantize_4bit(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + 
+                        F.linear(F.linear(x, self.lora_A), self.lora_B))
+                return (
+                    F.linear(x, bnb.functional.dequantize_4bit(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + self.scaling *
+                    F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)) 
+            elif self.quant_type=='nf4':
+                if self.pissa:
+                    return (
+                        F.linear(x, bnb.functional.dequantize_nf4(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + 
+                        F.linear(F.linear(x, self.lora_A), self.lora_B))
+                return (
+                    F.linear(x, bnb.functional.dequantize_nf4(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + self.scaling *
+                    F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B)) 
+            elif self.quant_type=='fp4':
+                if self.pissa:
+                    return (
+                        F.linear(x, bnb.functional.dequantize_fp4(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + 
+                        F.linear(F.linear(x, self.lora_A), self.lora_B))
+                return (
+                    F.linear(x, bnb.functional.dequantize_fp4(self.weight.data,quant_state=self.qstate).to(torch.bfloat16)) + self.scaling *
+                    F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B))  
+
+        if self.pissa:
+            return (
+                F.linear(x, self.weight) + 
+                F.linear(F.linear(x, self.lora_A), self.lora_B))
+        return (
+            F.linear(x, self.weight) + self.scaling *
+            F.linear(F.linear(self.lora_dropout(x), self.lora_A), self.lora_B))  
+
+
+@functools.wraps(LoraLinear)
+def make_linear_att(*args, **kwargs):
+    if "att" in LORA_CONFIG["parts"] and LORA_CONFIG["r"] > 0:
+        return LoraLinear(*args, **kwargs)
+    else:
+        return nn.Linear(*args, **kwargs)
+
+
+@functools.wraps(LoraLinear)
+def make_linear_ffn(*args, **kwargs):
+    if "ffn" in LORA_CONFIG["parts"] and LORA_CONFIG["r"] > 0:
+        return LoraLinear(*args, **kwargs)
+    else:
+        return nn.Linear(*args, **kwargs)
 
 try:
     print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
@@ -91,8 +192,7 @@ if 'x060' in os.environ["RWKV_MY_TESTING"]:
 
     def RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u):
         return WKV_6.apply(B, T, C, H, r, k, v, w, u)
-
-elif 'x052' in os.environ["RWKV_MY_TESTING"]:
+else:
     wkv5_cuda = load(name="wkv5", sources=["cuda/wkv5_op.cpp", f"cuda/wkv5_cuda.cu"],
                     verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
         
@@ -145,12 +245,9 @@ elif 'x052' in os.environ["RWKV_MY_TESTING"]:
     def RUN_CUDA_RWKV5(B, T, C, H, r, k, v, w, u):
         return WKV_5.apply(B, T, C, H, r, k, v, w, u)
 
-elif 'mamba' in os.environ["RWKV_MY_TESTING"]:
-    from mamba_ssm import Mamba
-
 ########################################################################################################
 
-class RWKV_Tmix_x052(MyModule):
+class RWKV_TimeMix_RWKV5(MyModule):
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -190,12 +287,12 @@ class RWKV_Tmix_x052(MyModule):
             self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.key = nn.Linear(args.n_embd, args.dim_att, bias=False)
+        self.receptance = make_linear_att(args.n_embd, args.dim_att, bias=False)
+        self.key = make_linear_att(args.n_embd, args.dim_att, bias=False)
+        self.value = make_linear_att(args.n_embd, args.dim_att, bias=False)
 
-        self.value = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
-        self.gate = nn.Linear(args.n_embd, args.dim_att, bias=False)
+        self.output = make_linear_att(args.dim_att, args.n_embd, bias=False)
+        self.gate = make_linear_att(args.n_embd, args.dim_att, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, args.dim_att)
 
     @MyFunction
@@ -259,9 +356,11 @@ class RWKV_Tmix_x060(MyModule):
             self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
             self.time_maa_g = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
 
-            D_MIX_LORA = 32 # generate TIME_MIX for w,k,v,r,g
-            self.time_maa_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MIX_LORA*5))
-            self.time_maa_w2 = nn.Parameter(torch.zeros(5, D_MIX_LORA, args.n_embd).uniform_(-0.01, 0.01))
+            TIME_MIX_EXTRA_DIM = 32 # generate TIME_MIX for w,k,v,r,g
+            if '7b' in args.load_model:
+                TIME_MIX_EXTRA_DIM = TIME_MIX_EXTRA_DIM*2
+            self.time_maa_w1 = nn.Parameter(torch.zeros(args.n_embd, TIME_MIX_EXTRA_DIM*5).uniform_(-1e-4, 1e-4))
+            self.time_maa_w2 = nn.Parameter(torch.zeros(5, TIME_MIX_EXTRA_DIM, args.n_embd).uniform_(-1e-4, 1e-4))
 
             # fancy time_decay
             decay_speed = torch.ones(args.dim_att)
@@ -269,9 +368,11 @@ class RWKV_Tmix_x060(MyModule):
                 decay_speed[n] = -6 + 5 * (n / (args.dim_att - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed.reshape(1,1,args.dim_att))
 
-            D_DECAY_LORA = 64
-            self.time_decay_w1 = nn.Parameter(torch.zeros(args.n_embd, D_DECAY_LORA))
-            self.time_decay_w2 = nn.Parameter(torch.zeros(D_DECAY_LORA, args.dim_att).uniform_(-0.01, 0.01))
+            TIME_DECAY_EXTRA_DIM = 64
+            if '7b' in args.load_model:
+                TIME_DECAY_EXTRA_DIM = TIME_DECAY_EXTRA_DIM*2
+            self.time_decay_w1 = nn.Parameter(torch.zeros(args.n_embd, TIME_DECAY_EXTRA_DIM).uniform_(-1e-4, 1e-4))
+            self.time_decay_w2 = nn.Parameter(torch.zeros(TIME_DECAY_EXTRA_DIM, args.dim_att).uniform_(-1e-4, 1e-4))
 
             tmp = torch.zeros(args.dim_att)
             for n in range(args.dim_att):
@@ -281,12 +382,11 @@ class RWKV_Tmix_x060(MyModule):
             self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.key = nn.Linear(args.n_embd, args.dim_att, bias=False)
-
-        self.value = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
-        self.gate = nn.Linear(args.n_embd, args.dim_att, bias=False)
+        self.receptance = make_linear_att(args.n_embd, args.dim_att, bias=False)
+        self.key = make_linear_att(args.n_embd, args.dim_att, bias=False)
+        self.value = make_linear_att(args.n_embd, args.dim_att, bias=False)
+        self.output = make_linear_att(args.dim_att, args.n_embd, bias=False)
+        self.gate = make_linear_att(args.n_embd, args.dim_att, bias=False)
         self.ln_x = nn.GroupNorm(self.n_head, args.dim_att, eps=(1e-5)*(args.head_size_divisor**2))
 
     @MyFunction
@@ -336,112 +436,7 @@ class RWKV_Tmix_x060(MyModule):
 
 ########################################################################################################
 
-class RWKV_Tmix_x060a(MyModule):
-    def __init__(self, args, layer_id):
-        super().__init__()
-        self.args = args
-        self.layer_id = layer_id
-
-        self.head_size = args.head_size_a
-        self.n_head = args.dim_att // self.head_size
-        assert args.dim_att % self.n_head == 0
-
-        with torch.no_grad():
-            ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, args.n_embd)
-            for i in range(args.n_embd):
-                ddd[0, 0, i] = i / args.n_embd
-
-            # fancy time_mix
-            self.time_maa_x = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
-            self.time_maa_w = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
-            self.time_maa_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
-            self.time_maa_v = nn.Parameter(1.0 - (torch.pow(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1))
-            self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-            self.time_maa_g = nn.Parameter(1.0 - torch.pow(ddd, 0.5 * ratio_1_to_almost0))
-
-            D_MIX_LORA = 32 # generate TIME_MIX for w,k,v,r,g
-            self.time_maa_w1 = nn.Parameter(torch.zeros(args.n_embd, D_MIX_LORA*5))
-            self.time_maa_w2 = nn.Parameter(torch.zeros(5, D_MIX_LORA, args.n_embd).uniform_(-0.01, 0.01))
-
-            # fancy time_decay
-            decay_speed = torch.ones(args.dim_att)
-            for n in range(args.dim_att):
-                decay_speed[n] = -6 + 5 * (n / (args.dim_att - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
-            self.time_decay = nn.Parameter(decay_speed.reshape(1,1,args.dim_att))
-
-            D_DECAY_LORA = 64
-            self.time_decay_w1 = nn.Parameter(torch.zeros(args.n_embd, D_DECAY_LORA))
-            self.time_decay_w2 = nn.Parameter(torch.zeros(D_DECAY_LORA, args.dim_att).uniform_(-0.01, 0.01))
-
-            tmp = torch.zeros(args.dim_att)
-            for n in range(args.dim_att):
-                zigzag = ((n + 1) % 3 - 1) * 0.1
-                tmp[n] = ratio_0_to_1 * (1 - (n / (args.dim_att - 1))) + zigzag
-
-            self.time_faaaa = nn.Parameter(tmp.reshape(self.n_head, self.head_size))
-
-            D_GATE_LORA = 64
-            self.gate_w1 = nn.Parameter(torch.empty(args.n_embd, D_GATE_LORA).uniform_(-0.01, 0.01))
-            self.gate_w2 = nn.Parameter(torch.zeros(D_GATE_LORA, args.n_embd).uniform_(-0.01, 0.01))
-
-        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
-        self.receptance = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.key = nn.Linear(args.n_embd, args.dim_att, bias=False)
-
-        self.value = nn.Linear(args.n_embd, args.dim_att, bias=False)
-        self.output = nn.Linear(args.dim_att, args.n_embd, bias=False)
-        self.ln_x = nn.GroupNorm(self.n_head, args.dim_att, eps=(1e-5)*(args.head_size_divisor**2))
-
-    @MyFunction
-    def jit_func(self, x):
-        B, T, C = x.size()
-
-        xx = self.time_shift(x) - x
-
-        xxx = x + xx * self.time_maa_x
-        xxx = torch.tanh(xxx @ self.time_maa_w1).view(B*T, 5, -1).transpose(0, 1)
-        xxx = torch.bmm(xxx, self.time_maa_w2).view(5, B, T, -1)
-        mw, mk, mv, mr, mg = xxx.unbind(dim=0)
-
-        xw = x + xx * (self.time_maa_w + mw)
-        xk = x + xx * (self.time_maa_k + mk)
-        xv = x + xx * (self.time_maa_v + mv)
-        xr = x + xx * (self.time_maa_r + mr)
-        xg = x + xx * (self.time_maa_g + mg)
-
-        r = self.receptance(xr)
-        k = self.key(xk)
-        v = self.value(xv)
-        g = torch.tanh(xg @ self.gate_w1) @ self.gate_w2
-
-        ww = torch.tanh(xw @ self.time_decay_w1) @ self.time_decay_w2
-        w = self.time_decay + ww
-
-        return r, k, v, g, w
-
-    @MyFunction
-    def jit_func_2(self, x, g):
-        B, T, C = x.size()
-        x = x.view(B * T, C)
-        
-        x = self.ln_x(x).view(B, T, C)
-        x = self.output(x * g)
-        return x
-
-    def forward(self, x):
-        B, T, C = x.size()
-        H = self.n_head
-
-        r, k, v, g, w = self.jit_func(x)
-        x = RUN_CUDA_RWKV6(B, T, C, H, r, k, v, w, u=self.time_faaaa)
-
-        return self.jit_func_2(x, g)
-
-########################################################################################################
-
-class RWKV_CMix_x052(MyModule):
+class RWKV_ChannelMix(MyModule):
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -456,9 +451,9 @@ class RWKV_CMix_x052(MyModule):
             self.time_mix_k = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
             self.time_mix_r = nn.Parameter(torch.pow(ddd, ratio_1_to_almost0))
         
-        self.key = nn.Linear(args.n_embd, args.dim_ffn, bias=False)
-        self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
-        self.value = nn.Linear(args.dim_ffn, args.n_embd, bias=False)
+        self.key = make_linear_ffn(args.n_embd, args.dim_ffn, bias=False)
+        self.receptance = make_linear_ffn(args.n_embd, args.n_embd, bias=False)
+        self.value = make_linear_ffn(args.dim_ffn, args.n_embd, bias=False)
 
     @MyFunction
     def forward(self, x):
@@ -485,9 +480,9 @@ class RWKV_CMix_x060(MyModule):
             self.time_maa_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
             self.time_maa_r = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0))
 
-        self.key = nn.Linear(args.n_embd, args.dim_ffn, bias=False)
-        self.receptance = nn.Linear(args.n_embd, args.n_embd, bias=False)
-        self.value = nn.Linear(args.dim_ffn, args.n_embd, bias=False)
+        self.key = make_linear_ffn(args.n_embd, args.dim_ffn, bias=False)
+        self.receptance = make_linear_ffn(args.n_embd, args.n_embd, bias=False)
+        self.value = make_linear_ffn(args.dim_ffn, args.n_embd, bias=False)
 
     @MyFunction
     def forward(self, x):
@@ -554,23 +549,18 @@ class Block(nn.Module):
         if self.layer_id == 0 and self.args.pre_ffn > 0:
             self.ffnPre = RWKV_ChannelMix(args, 0)
         else:
-            if 'x060a' in os.environ["RWKV_MY_TESTING"]:
-                self.att = RWKV_Tmix_x060a(args, layer_id)
-            elif 'x060' in os.environ["RWKV_MY_TESTING"]:
+            if 'x060' in os.environ["RWKV_MY_TESTING"]:
                 self.att = RWKV_Tmix_x060(args, layer_id)
-            elif 'x052' in os.environ["RWKV_MY_TESTING"]:
-                self.att = RWKV_Tmix_x052(args, layer_id)
-            elif 'mamba' in os.environ["RWKV_MY_TESTING"]:
-                self.att = Mamba(d_model=args.n_embd, d_state=16, d_conv=4, expand=2.125) # match rwkv6 #params
+            else:
+                self.att = RWKV_TimeMix_RWKV5(args, layer_id)
 
         if 'g' in os.environ["RWKV_MY_TESTING"]:
             self.ffn = MishGLU(args, layer_id)
-        elif 'x060' in os.environ["RWKV_MY_TESTING"]:
-            self.ffn = RWKV_CMix_x060(args, layer_id)
-        elif 'x052' in os.environ["RWKV_MY_TESTING"]:
-            self.ffn = RWKV_CMix_x052(args, layer_id)
-        elif 'mamba' in os.environ["RWKV_MY_TESTING"]:
-            self.ffn = Mamba(d_model=args.n_embd, d_state=16, d_conv=4, expand=2.125) # match rwkv6 #params
+        else:
+            if 'x060' in os.environ["RWKV_MY_TESTING"]:
+                self.ffn = RWKV_CMix_x060(args, layer_id)
+            else:
+                self.ffn = RWKV_ChannelMix(args, layer_id)
         
         if args.tiny_att_dim > 0 and self.layer_id == args.tiny_att_layer:
             self.tiny_ln = nn.LayerNorm(args.n_embd)
@@ -639,10 +629,7 @@ class RWKV(pl.LightningModule):
         if not hasattr(args, 'dim_att'):
             args.dim_att = args.n_embd
         if not hasattr(args, 'dim_ffn'):
-            if '-f4' in os.environ["RWKV_MY_TESTING"]:
-                args.dim_ffn = int((args.n_embd * 4) // 32 * 32)
-            else:
-                args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size            
+            args.dim_ffn = args.n_embd * 4
         if not hasattr(args, 'tiny_att_layer'):
             args.tiny_att_layer = -1
         if not hasattr(args, 'tiny_att_dim'):
@@ -755,13 +742,19 @@ class RWKV(pl.LightningModule):
         if args.tiny_att_dim > 0:
             for block in self.blocks:
                 if args.grad_cp == 1:
-                    x = deepspeed.checkpointing.checkpoint(block, x, x_emb)
+                    if args.lora:
+                        x = torch_checkpoint(block, x, x_emb, use_reentrant=False)
+                    else:
+                        x = deepspeed.checkpointing.checkpoint(block, x, x_emb)
                 else:
                     x = block(x, x_emb)
         else:
             for block in self.blocks:
                 if args.grad_cp == 1:
-                    x = deepspeed.checkpointing.checkpoint(block, x)
+                    if args.lora:
+                        x = torch_checkpoint(block, x, x_emb ,use_reentrant=False)
+                    else:
+                        x = deepspeed.checkpointing.checkpoint(block, x)
                 else:
                     x = block(x)
 
@@ -844,97 +837,60 @@ class RWKV(pl.LightningModule):
 """
         )
         m = {}
-        n_params = 0
         for n in self.state_dict():
             p = self.state_dict()[n]
             shape = p.shape
 
-            s0 = str(shape[0]) if len(shape) > 0 else ""
-            s1 = str(shape[1]) if len(shape) > 1 else ""
-            s2 = str(shape[2]) if len(shape) > 2 else ""
-            print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {n}", end="")
-
             gain = 1.0
             scale = 1.0
-            if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias'):
+            if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n:
                 if 'ln_x.weight' in n:
                     layer_scale = (1+int(n.split('.')[1])) / self.args.n_layer
                     m[n] = (p * 0.0) + (layer_scale ** 0.7)
                 else:
                     m[n] = p
-                print()
             else:
-                if 'mamba' in os.environ["RWKV_MY_TESTING"]:
-                    m[n] = p
-                    if n == "emb.weight":
-                        scale = -1e-4
-                        nn.init.uniform_(m[n], a=scale, b=-scale)
-                        print(f" [scale {scale}]")
-                    elif n == "head.weight":
-                        if shape[1] > shape[0]: # !!! only for pytorch where linear layer weight is transposed !!!
-                            gain = math.sqrt(shape[1] / shape[0])
-                        nn.init.orthogonal_(m[n], gain=gain * scale)
-                        print(f" [scale {scale}]")
-                    elif '.out_proj.weight' in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    elif '.bias' in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    else:
-                        print()
+                if n == "emb.weight":
+                    scale = -1 * self.args.lr_init
                 else:
-                    if n == "emb.weight":
-                        scale = -1e-4
-                    else:
-                        assert n.endswith('.weight')
-                        if shape[1] > shape[0]: # !!! only for pytorch where linear layer weight is transposed !!!
-                            gain = math.sqrt(shape[1] / shape[0])
+                    if shape[0] > shape[1]:
+                        gain = math.sqrt(shape[0] / shape[1])
 
-                        zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
+                    zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
 
-                        for kk in zero:
-                            if kk in n:
-                                scale = 0
-                        if "head_k." in n:
-                            scale = 0.1
-                        if "head_q." in n:
+                    for kk in zero:
+                        if kk in n:
                             scale = 0
+                    if n == "head.weight":
+                        scale = 0.5
+                    if "head_k." in n:
+                        scale = 0.1
+                    if "head_q." in n:
+                        scale = 0
 
-                        for kk in [".att.key."]:
-                            if kk in n:
-                                scale = 0.1
-                        for kk in [".att.gate."]:
-                            if kk in n:
-                                scale = 0.1
+                print(f"{str(shape[0]).ljust(5)} {str(shape[1]).ljust(5)} {str(scale).ljust(4)} {n}")
 
-                    print(f" [scale {scale}]")
+                if self.args.accelerator.upper() == "GPU":
+                    m[n] = torch.empty((shape[0], shape[1]), device="cuda")
+                else:
+                    m[n] = torch.empty((shape[0], shape[1]))
 
-                    if self.args.accelerator.upper() == "GPU":
-                        m[n] = torch.empty((shape[0], shape[1]), device="cuda")
-                    else:
-                        m[n] = torch.empty((shape[0], shape[1]))
-
-                    if scale == 0:
-                        nn.init.zeros_(m[n])
-                    elif scale < 0:
-                        nn.init.uniform_(m[n], a=scale, b=-scale)
-                    else:
-                        nn.init.orthogonal_(m[n], gain=gain * scale)
+                if scale == 0:
+                    nn.init.zeros_(m[n])
+                elif scale < 0:
+                    nn.init.uniform_(m[n], a=scale, b=-scale)
+                else:
+                    nn.init.orthogonal_(m[n], gain=gain * scale)
 
             m[n] = m[n].cpu()
             if os.environ["RWKV_FLOAT_MODE"] == "fp16":
                 m[n] = m[n].half()
             elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
                 m[n] = m[n].bfloat16()
-            n_params += m[n].numel()
 
             # if n == "emb.weight":
             #     print(m[n])
 
-        print('model params', n_params)
         gc.collect()
         torch.cuda.empty_cache()
         return m
